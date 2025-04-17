@@ -64,25 +64,25 @@ except Exception as e:
 
 # --- API Definition ---
 app = FastAPI(
-    title="Watermark API",
-    description="An API to generate watermark using the LLM and the image generation model.",
+    title="Multimodal Watermark API",
+    description="An API to generate and detect watermarks in text, images and potentially other modalities (e.g., audio, video).",
     version="1.0.0",
 )
 
 # --- Request & Response Models ---
-class GenerationRequest(BaseModel):
+class TextGenerationRequest(BaseModel):
     prompt: str = DEFAULT_PROMPT # Default prompt in Korean
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS # Default max_new_tokens
     watermark: bool = False # Add watermark flag, default to False
 
-class GenerationResponse(BaseModel):
+class TextGenerationResponse(BaseModel):
     response: str
 
-class DetectionRequest(BaseModel):
+class TextDetectionRequest(BaseModel):
     text: str # Text to detect watermark in
     threshold: float = TEXT_DETECTOR_THRESHOLD # Threshold for z-score based prediction
 
-class DetectionResponse(BaseModel):
+class TextDetectionResponse(BaseModel):
     # Based on typical output of WatermarkDetector.detect()
     num_tokens_scored: int
     num_green_tokens: int
@@ -93,11 +93,11 @@ class DetectionResponse(BaseModel):
     confidence: Optional[float] = None # Optional로 변경, prediction이 True일 때만 값 가짐
 
 # --- API Endpoint ---
-@app.post("/generate",
-          response_model=GenerationResponse,
+@app.post("/generate_text",
+          response_model=TextGenerationResponse,
           summary="Generate text based on a prompt, optionally with watermark",
-          description="Takes a user prompt and returns the model's generated response. Allows specifying max_new_tokens and enabling watermark.")
-async def generate_text(request: GenerationRequest):
+          description="Takes a user prompt and returns the model's generated text response. Allows specifying max_new_tokens and enabling watermark.")
+async def generate_text_endpoint(request: TextGenerationRequest):
     """
     Generates text using the preloaded EXAONE model, optionally applying a watermark.
 
@@ -147,23 +147,23 @@ async def generate_text(request: GenerationRequest):
 
         response_text = tokenizer.decode(output_ids, skip_special_tokens=True)
 
-        return GenerationResponse(response=response_text)
+        return TextGenerationResponse(response=response_text)
     except Exception as e:
-        error_type = "watermarked generation" if request.watermark else "generation"
+        error_type = "watermarked text generation" if request.watermark else "text generation"
         print(f"Error during {error_type}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error during text {error_type}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error during {error_type}: {e}")
 
 
 # --- Watermark Detection Endpoint ---
-@app.post("/detect_watermark",
-          response_model=DetectionResponse,
+@app.post("/detect_text_watermark",
+          response_model=TextDetectionResponse,
           summary="Detect watermark in a given text using a specific threshold",
-          description="Takes a text string and a mandatory threshold. Modifies the detector's shared threshold for prediction and returns detection scores. P-value is only returned if prediction is True. **Warning: Modifying shared state without a lock can lead to race conditions.**")
-async def detect_watermark(request: DetectionRequest):
+          description="Takes a text string and a mandatory threshold. Modifies the detector's shared threshold for prediction and returns text watermark detection scores. P-value is only returned if prediction is True. **Warning: Modifying shared state without a lock can lead to race conditions.**")
+async def detect_text_watermark_endpoint(request: TextDetectionRequest):
     """
     Detects the presence of a watermark in the input text using the requested threshold.
     Modifies the shared detector's z-score threshold for the 'prediction' calculation.
-    Returns scores. p_value is only included if the prediction is True.
+    Returns text watermark scores. p_value is only included if the prediction is True.
 
     **Warning**: Modifying the shared detector's threshold per request **without a lock** can lead to race conditions
                  under concurrent load, where one request might interfere with another's threshold setting.
@@ -197,10 +197,10 @@ async def detect_watermark(request: DetectionRequest):
 
     try:
         # Pydantic 모델을 사용하여 응답 반환 (유효성 검사 포함)
-        return DetectionResponse(**response_data)
+        return TextDetectionResponse(**response_data)
     except Exception as e: # Pydantic 유효성 검사 오류 등 처리
-        print(f"Error preparing/validating detection response: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error processing detection results: {e}")
+        print(f"Error preparing/validating text detection response: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error processing text detection results: {e}")
 
 # --- Running the App (Optional) ---
 if __name__ == "__main__":
