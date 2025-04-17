@@ -14,8 +14,6 @@ from schemas import (
     DEFAULT_MAX_NEW_TOKENS,
     TEXT_DETECTOR_THRESHOLD
 )
-# Removed direct import of WatermarkProcessor, WatermarkDetector, BaseModel, Optional, sys, lm_watermarking
-
 
 # Hyperparameters (keep main constants or move to config)
 MODEL_NAME = "LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct"
@@ -26,21 +24,12 @@ model, tokenizer, watermark_processor, watermark_detector, device = load_models_
     MODEL_NAME, TEXT_DETECTOR_THRESHOLD
 )
 
-# Check if loading was successful
-if model is None:
-    print("Failed to load model. Exiting or running in degraded mode.")
-    # Depending on requirements, you might want to exit or prevent the API from starting fully.
-    # For now, endpoints will raise 503 if model is None.
-
 # --- API Definition ---
 app = FastAPI(
     title="Multimodal Watermark API",
     description="An API to generate and detect watermarks in text, images and potentially other modalities (e.g., audio, video).",
     version="1.0.0",
 )
-
-# --- Request & Response Models ---
-# Definitions are now moved to schemas.py
 
 # --- API Endpoint ---
 @app.post("/generate_text",
