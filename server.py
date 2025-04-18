@@ -8,6 +8,8 @@ import traceback
 import os
 import uuid
 from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
 
 # Import from new modules
 from model_loader import load_models_and_processors, load_image_watermark_model
@@ -209,15 +211,35 @@ async def embed_image_endpoint(embed_request: ImageEmbedRequest, http_request: R
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"Internal server error saving image: {e}")
 
-        # 7. Construct the full URL for the saved image
-        # Use request object to get base URL
+        # 6.1. Calculate and save the difference image
+        original_img_tensor_unnormalized = unnormalize_img(img_pt.squeeze(0)) # 원본 이미지 텐서
+        original_np = (original_img_tensor_unnormalized.permute(1, 2, 0).detach().cpu().numpy() * 255).astype('uint8')
+        watermarked_np = (final_img_tensor_unnormalized.permute(1, 2, 0).detach().cpu().numpy() * 255).astype('uint8')
+
+        # 차이 계산 및 시각화 (inference_utils.py 참고)
+        delta = watermarked_np.astype(np.float32) - original_np.astype(np.float32)
+        delta_visual = np.clip(np.abs(10 * delta), 0, 255).astype('uint8') # 스케일링 및 클리핑
+
+        # Matplotlib을 사용하여 흑백 이미지로 저장
+        diff_filename = f"diff_{uuid.uuid4()}.png"
+        diff_save_path = os.path.join(IMAGE_DIR, diff_filename)
+        try:
+            plt.imsave(diff_save_path, delta_visual.mean(axis=2), cmap='hot', format='png') # 흑백 'hot' colormap 사용
+        except Exception as e:
+            print(f"Error saving difference image file: {e}")
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Internal server error saving difference image: {e}")
+
+        # 7. Construct the full URLs for the saved images
         base_url = str(http_request.base_url)
-        # Ensure base_url ends with '/' and static path doesn't start with '/'
-        static_path = os.path.join("static", "generated_images", filename).replace("\\", "/") # Ensure forward slashes
+        static_path = os.path.join("static", "generated_images", filename).replace("\\", "/")
         image_url = f"{base_url.rstrip('/')}/{static_path.lstrip('/')}"
 
-        # 8. Return the URL in the response
-        return ImageEmbedResponse(image_url=image_url)
+        diff_static_path = os.path.join("static", "generated_images", diff_filename).replace("\\", "/")
+        difference_image_url = f"{base_url.rstrip('/')}/{diff_static_path.lstrip('/')}"
+
+        # 8. Return the URLs in the response
+        return ImageEmbedResponse(image_url=image_url, difference_image_url=difference_image_url)
 
     except HTTPException as e:
         raise e

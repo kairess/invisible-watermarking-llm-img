@@ -56,6 +56,7 @@ class ImageEmbedRequest(BaseModel):
 class ImageEmbedResponse(BaseModel):
     """Response model for embedding image watermark."""
     image_url: str = Field(..., description="URL of the saved watermarked image file")
+    difference_image_url: str = Field(..., description="URL of the saved difference visualization image file")
 
 class ImageDetectRequest(BaseModel):
     """Request model for detecting image watermark."""
