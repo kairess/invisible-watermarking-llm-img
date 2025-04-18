@@ -7,4 +7,4 @@ __pycache__
 .DS_Store
 lm_watermarking
 watermark_anything
-
+static/generated_images

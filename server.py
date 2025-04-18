@@ -1,7 +1,16 @@
 import torch
-from transformers import LogitsProcessorList # Removed AutoModelForCausalLM, AutoTokenizer
-from fastapi import FastAPI, HTTPException
+from transformers import LogitsProcessorList
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
 import uvicorn
+import base64
+import io
+from PIL import Image, UnidentifiedImageError
+import torch.nn.functional as F
+import traceback
+import re
+import os
+import uuid
 
 # Import from new modules
 from model_loader import load_models_and_processors, load_image_watermark_model
@@ -10,32 +19,63 @@ from schemas import (
     TextGenerationResponse,
     TextDetectionRequest,
     TextDetectionResponse,
-    DEFAULT_PROMPT, # Import defaults if needed here
+    ImageDetectResponse,
+    DetectedMessageInfo,
+    ImageEmbedRequest,
+    ImageEmbedResponse, 
+    ImageDetectRequest,
+    DEFAULT_PROMPT,
     DEFAULT_MAX_NEW_TOKENS,
     TEXT_DETECTOR_THRESHOLD
 )
 
-# Hyperparameters (keep main constants or move to config)
+# watermark_anything 유틸리티 함수 import
+try:
+    from watermark_anything.notebooks.inference_utils import (
+        default_transform,
+        multiwm_dbscan,
+        msg2str,
+        create_random_mask,
+    )
+    def unnormalize_img(img_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
+        unnormalized = img_tensor.clone()
+        for t, m, s in zip(unnormalized, mean, std):
+            t.mul_(s).add_(m)
+        return unnormalized.clamp(0, 1)
+except ImportError as e:
+    print(f"Warning: Could not import watermark_anything utilities: {e}. Image watermarking endpoints might not work.")
+    default_transform = None
+    multiwm_dbscan = None
+    msg2str = None
+    create_random_mask = None
+    unnormalize_img = None
+
+# Hyperparameters
 MODEL_NAME = "LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct"
-IMAGE_CHECKPOINT_DIR = "watermark_anything/checkpoints" # 이미지 모델 체크포인트 디렉토리 경로 (checkpoints/params.json에서 설정파일 경로 수정해야 함)
+IMAGE_CHECKPOINT_DIR = "watermark_anything/checkpoints"
+
+# --- Static File Configuration ---
+STATIC_DIR = "static"
+IMAGE_DIR = os.path.join(STATIC_DIR, "generated_images")
+os.makedirs(IMAGE_DIR, exist_ok=True) # 이미지 저장 디렉토리 생성
 
 # --- Load Models and Processors ---
-# Call the loading function from model_loader
 text_model, tokenizer, watermark_processor, watermark_detector, device = load_models_and_processors(
     MODEL_NAME, TEXT_DETECTOR_THRESHOLD
 )
-
-# model_loader에서 이미지 워터마킹 모델 로딩 함수 호출
 image_watermark_model = load_image_watermark_model(checkpoint_dir=IMAGE_CHECKPOINT_DIR, device=device)
 
 # --- API Definition ---
 app = FastAPI(
     title="Multimodal Watermark API",
-    description="An API to generate and detect watermarks in text, images and potentially other modalities (e.g., audio, video).",
-    version="1.0.0",
+    description="An API to generate/detect watermarks. Embed endpoint saves image and returns URL.",
+    version="1.1.0",
 )
 
-# --- API Endpoint ---
+# Mount static directory AFTER FastAPI app initialization
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# --- Text Generation Endpoint ---
 @app.post("/generate_text",
           response_model=TextGenerationResponse,
           summary="Generate text based on a prompt, optionally with watermark",
@@ -50,8 +90,6 @@ async def generate_text_endpoint(request: TextGenerationRequest):
     """
     if text_model is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Text model not loaded. Service unavailable.")
-
-    # Check if watermark is requested but processor is not available
     if request.watermark and watermark_processor is None:
         raise HTTPException(status_code=503, detail="Watermark processor not loaded. Cannot generate watermarked text.")
 
@@ -61,13 +99,9 @@ async def generate_text_endpoint(request: TextGenerationRequest):
             {"role": "user", "content": request.prompt}
         ]
         input_ids = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        ).to(device) # Move input tensors to the correct device
+            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+        ).to(device)
 
-        # Prepare logits processor based on the watermark flag
         logits_processor_list = None
         if request.watermark:
             logits_processor_list = LogitsProcessorList([watermark_processor])
@@ -75,16 +109,12 @@ async def generate_text_endpoint(request: TextGenerationRequest):
         generated_ids = text_model.generate(
             input_ids,
             eos_token_id=tokenizer.eos_token_id,
-            max_new_tokens=request.max_new_tokens, # Use max_new_tokens from request
-            logits_processor=logits_processor_list, # Apply watermark processor if requested
-            do_sample=False, # Consider setting do_sample based on use case
+            max_new_tokens=request.max_new_tokens,
+            logits_processor=logits_processor_list,
+            do_sample=False,
         )
-
-        # Extract only the generated tokens, excluding the input prompt
         output_ids = generated_ids[0][input_ids.shape[1]:]
-
         response_text = tokenizer.decode(output_ids, skip_special_tokens=True)
-
         return TextGenerationResponse(response=response_text)
     except Exception as e:
         error_type = "watermarked text generation" if request.watermark else "text generation"
@@ -92,7 +122,7 @@ async def generate_text_endpoint(request: TextGenerationRequest):
         raise HTTPException(status_code=500, detail=f"Internal server error during {error_type}: {e}")
 
 
-# --- Watermark Detection Endpoint ---
+# --- Text Watermark Detection Endpoint ---
 @app.post("/detect_text_watermark",
           response_model=TextDetectionResponse,
           summary="Detect watermark in a given text using a specific threshold",
@@ -111,42 +141,184 @@ async def detect_text_watermark_endpoint(request: TextDetectionRequest):
     """
     if watermark_detector is None:
         raise HTTPException(status_code=503, detail="Watermark detector is not initialized. Service unavailable.")
-
     if not request.text:
         raise HTTPException(status_code=400, detail="Input text cannot be empty.")
 
-    original_threshold = watermark_detector.z_threshold # 원래 임계값 저장 (선택 사항)
+    original_threshold = watermark_detector.z_threshold
     watermark_detector.z_threshold = request.threshold
-
     score_dict = None
     try:
-        # 탐지 수행 - prediction은 설정된 임계값을 사용하여 계산됨
         score_dict = watermark_detector.detect(request.text)
-
-        # 응답 데이터 준비
         response_data = {
             "num_tokens_scored": score_dict.get("num_tokens_scored"),
             "num_green_tokens": score_dict.get("num_green_tokens"),
             "green_fraction": score_dict.get("green_fraction"),
             "z_score": score_dict.get("z_score"),
-            "prediction": score_dict.get("prediction"),
             "p_value": score_dict.get("p_value"),
+            "prediction": score_dict.get("prediction"),
             "confidence": score_dict.get("confidence")
         }
-        # Pydantic 모델을 사용하여 응답 반환 (유효성 검사 포함)
         return TextDetectionResponse(**response_data)
-
-    except Exception as e: # 탐지 또는 응답 준비 중 오류 처리
+    except Exception as e:
         print(f"Error during text detection or response preparation: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error during text detection: {e}")
     finally:
-        # 원래 임계값으로 복원 (선택 사항, finally 블록에서 실행 보장)
-        # 하지만 동시 요청 환경에서는 여전히 문제가 발생할 수 있습니다.
         watermark_detector.z_threshold = original_threshold
+
+# --- Helper function to load image from Base64 ---
+def load_image_from_base64(base64_string: str) -> Image.Image:
+    """Decodes a Base64 string (with optional data URL prefix) into a PIL Image."""
+    try:
+        # 데이터 URL 프리픽스 제거 (예: "data:image/png;base64,")
+        base64_data = re.sub('^data:image/.+;base64,', '', base64_string)
+        # Base64 디코딩
+        image_data = base64.b64decode(base64_data)
+        # BytesIO를 사용하여 이미지 열기
+        image = Image.open(io.BytesIO(image_data))
+        # 이미지 형식이 RGB가 아니면 변환
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        return image
+    except (base64.binascii.Error, ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid Base64 string: {e}")
+    except UnidentifiedImageError:
+        raise HTTPException(status_code=400, detail="Invalid image data in Base64 string.")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load image from Base64: {e}")
+
+
+# --- Image Watermark Embedding Endpoint ---
+@app.post("/embed_image",
+          response_model=ImageEmbedResponse, # 응답 모델 확인
+          summary="Embed watermarks, save image, and return URL",
+          description="Takes Base64 image, messages, mask proportion. Embeds watermarks, saves the result on the server, and returns the URL to the saved image.")
+async def embed_image_endpoint(embed_request: ImageEmbedRequest, http_request: Request): # embed_request 이름 변경, http_request 추가
+    """
+    Embeds watermarks into the image, saves it locally, and returns its URL.
+
+    - **embed_request**: Contains `image_base64`, `messages`, `mask_proportion`.
+    - **http_request**: Used to construct the base URL for the response.
+    """
+    if image_watermark_model is None:
+        raise HTTPException(status_code=503, detail="Image watermark model (WAM) not loaded.")
+    if default_transform is None or create_random_mask is None or unnormalize_img is None:
+         raise HTTPException(status_code=500, detail="Required image processing functions not available.")
+
+    try:
+        # 1. Load image from Base64
+        pil_image = load_image_from_base64(embed_request.image_base64)
+        img_pt = default_transform(pil_image).unsqueeze(0).to(device)
+
+        # 2. Prepare watermark messages
+        try:
+            wm_msgs = torch.tensor(embed_request.messages, dtype=torch.int64).to(device)
+            num_messages = wm_msgs.shape[0]
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid message format: {e}")
+
+        # 3. Create random masks
+        masks = create_random_mask(img_pt, num_masks=num_messages, mask_percentage=embed_request.mask_proportion).to(device)
+
+        # 4. Embed watermarks iteratively
+        multi_wm_img_tensor = img_pt.clone()
+        for i in range(num_messages):
+            wm_msg = wm_msgs[i].unsqueeze(0)
+            mask = masks[i].unsqueeze(0) # Ensure mask is [1, 1, H, W]
+            with torch.no_grad():
+                 outputs = image_watermark_model.embed(img_pt, wm_msg)
+            watermarked_segment = outputs['imgs_w']
+            multi_wm_img_tensor = watermarked_segment * mask + multi_wm_img_tensor * (1 - mask)
+
+        # 5. Postprocess the final watermarked tensor
+        final_img_tensor_unnormalized = unnormalize_img(multi_wm_img_tensor.squeeze(0))
+        result_image = Image.fromarray((final_img_tensor_unnormalized.permute(1, 2, 0).detach().cpu().numpy() * 255).astype('uint8'))
+
+        # 6. Save the result image to the static directory
+        filename = f"{uuid.uuid4()}.png" # 고유 파일명 생성
+        save_path = os.path.join(IMAGE_DIR, filename)
+        try:
+            result_image.save(save_path, format="PNG")
+        except Exception as e:
+            print(f"Error saving image file: {e}")
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Internal server error saving image: {e}")
+
+        # 7. Construct the full URL for the saved image
+        # Use request object to get base URL
+        base_url = str(http_request.base_url)
+        # Ensure base_url ends with '/' and static path doesn't start with '/'
+        static_path = os.path.join("static", "generated_images", filename).replace("\\", "/") # Ensure forward slashes
+        image_url = f"{base_url.rstrip('/')}/{static_path.lstrip('/')}"
+
+        # 8. Return the URL in the response
+        return ImageEmbedResponse(image_url=image_url)
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Error during image embedding: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal server error during image embedding: {e}")
+
+
+# --- Image Watermark Detection Endpoint ---
+@app.post("/detect_image_watermark",
+          response_model=ImageDetectResponse,
+          summary="Detect watermark messages in an image provided as Base64",
+          description="Takes a Base64 encoded image file and DBSCAN parameters, detects watermark messages using WAM, and returns the found messages.")
+async def detect_image_watermark_endpoint(request: ImageDetectRequest):
+    """
+    Detects watermark messages embedded in the image provided as Base64.
+
+    - **request**: Contains `image_base64`, `epsilon`, and `min_samples`.
+    """
+    if image_watermark_model is None:
+        raise HTTPException(status_code=503, detail="Image watermark model (WAM) not loaded. Service unavailable.")
+    if default_transform is None or multiwm_dbscan is None or msg2str is None:
+         raise HTTPException(status_code=500, detail="Required image processing/detection functions not available.")
+
+    try:
+        # 1. Load image from Base64 string
+        pil_image = load_image_from_base64(request.image_base64)
+        img_pt = default_transform(pil_image).unsqueeze(0).to(device) # [1, 3, H, W]
+
+        # 2. Detect watermark signals
+        with torch.no_grad(): # 탐지 시에도 그래디언트 계산 비활성화
+            preds = image_watermark_model.detect(img_pt)["preds"].to(device)
+
+        # 3. Extract predictions
+        mask_preds = F.sigmoid(preds[:, 0, :, :])
+        bit_preds = preds[:, 1:, :, :]
+
+        # 4. Use DBSCAN to find message centroids
+        centroids, positions = multiwm_dbscan(
+            bit_preds,
+            mask_preds,
+            epsilon=request.epsilon, # 요청에서 값 사용
+            min_samples=request.min_samples # 요청에서 값 사용
+        )
+
+        # 5. Format results
+        detected_messages_info = []
+        if centroids:
+             centroids_pt = torch.stack(list(centroids.values())).detach().cpu()
+             for msg_tensor in centroids_pt:
+                 msg_string = msg2str(msg_tensor)
+                 detected_messages_info.append(DetectedMessageInfo(message=msg_string))
+
+        return ImageDetectResponse(
+            num_messages_found=len(detected_messages_info),
+            detected_messages=detected_messages_info
+        )
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Error during image watermark detection: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal server error during image watermark detection: {e}")
 
 
 # --- Running the App (Optional) ---
 if __name__ == "__main__":
-    # Make sure to run with uvicorn for production: uvicorn main:app --reload
-    # Example: uvicorn server:app --host 0.0.0.0 --port 7860 (파일 이름이 server.py라고 가정)
     uvicorn.run(app, host="0.0.0.0", port=7860)
