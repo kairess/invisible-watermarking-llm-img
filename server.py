@@ -21,27 +21,29 @@ from schemas import (
     TextGenerationResponse,
     TextDetectionRequest,
     TextDetectionResponse,
-    ImageDetectResponse,
-    DetectedMessageInfo,
     ImageEmbedRequest,
-    ImageEmbedResponse, 
+    ImageEmbedResponse,
     ImageDetectRequest,
+    ImageDetectResponse as ImageDetectResponseSchema,
     DEFAULT_PROMPT,
     DEFAULT_MAX_NEW_TOKENS,
-    TEXT_DETECTOR_THRESHOLD
+    TEXT_DETECTOR_THRESHOLD,
+    DetectedMessageInfo,
 )
 
 # 헬퍼 함수 import 추가
-from utils import load_image_from_base64, unnormalize_img
+from utils import load_image_from_base64, unnormalize_img, BinaryStringConverter, sort_masks_by_position, sort_centroids_by_position
 
 # watermark_anything 유틸리티 함수 import
 from watermark_anything.notebooks.inference_utils import (
     default_transform,
     multiwm_dbscan,
-    msg2str,
+    msg2str, # 범례 표시에 계속 사용
     create_random_mask,
 )
 
+# --- Binary String Converter Instance ---
+converter = BinaryStringConverter()
 
 # Hyperparameters
 MODEL_NAME = "LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct"
@@ -62,7 +64,7 @@ image_watermark_model = load_image_watermark_model(checkpoint_dir=IMAGE_CHECKPOI
 app = FastAPI(
     title="Multimodal Watermark API",
     description="An API to generate/detect watermarks. Embed endpoint saves image and returns URL.",
-    version="1.1.0",
+    version="1.2.0", # 버전 업데이트
 )
 
 # Mount static directory AFTER FastAPI app initialization
@@ -160,14 +162,16 @@ async def detect_text_watermark_endpoint(request: TextDetectionRequest):
 
 # --- Image Watermark Embedding Endpoint ---
 @app.post("/embed_image",
-          response_model=ImageEmbedResponse, # 응답 모델 확인
-          summary="Embed watermarks, save image, and return URL",
-          description="Takes Base64 image, messages, mask proportion. Embeds watermarks, saves the result on the server, and returns the URL to the saved image.")
-async def embed_image_endpoint(embed_request: ImageEmbedRequest, http_request: Request): # embed_request 이름 변경, http_request 추가
+          response_model=ImageEmbedResponse,
+          summary="Embed string watermark, save image, and return URL",
+          description="Takes Base64 image, a string message, mask proportion. Converts string to binary chunks, embeds them sequentially based on mask position, saves the result, and returns URLs.")
+async def embed_image_endpoint(embed_request: ImageEmbedRequest, http_request: Request):
     """
-    Embeds watermarks into the image, saves it locally, and returns its URL.
+    Embeds a string watermark into the image, saves it locally, and returns its URL.
+    The string is converted to binary chunks, and masks are sorted by x-coordinate
+    for sequential embedding.
 
-    - **embed_request**: Contains `image_base64`, `messages`, `mask_proportion`.
+    - **embed_request**: Contains `image_base64`, `message` (string), `mask_proportion`.
     - **http_request**: Used to construct the base URL for the response.
     """
     if image_watermark_model is None:
@@ -176,36 +180,50 @@ async def embed_image_endpoint(embed_request: ImageEmbedRequest, http_request: R
          raise HTTPException(status_code=500, detail="Required image processing functions not available.")
 
     try:
-        # 1. Load image from Base64 (utils 함수 사용)
+        # 1. Load image from Base64
         pil_image = load_image_from_base64(embed_request.image_base64)
         img_pt = default_transform(pil_image).unsqueeze(0).to(device)
 
-        # 2. Prepare watermark messages
+        # 2. Convert string message to binary tensor chunks
         try:
-            wm_msgs = torch.tensor(embed_request.messages, dtype=torch.int64).to(device)
-            num_messages = wm_msgs.shape[0]
+            # converter 사용
+            wm_msgs = converter.string_to_binary(embed_request.message).to(device)
+            if wm_msgs.shape[0] == 0: # 빈 문자열 등 변환 결과가 없을 경우
+                 raise HTTPException(status_code=400, detail="Input message resulted in empty binary data.")
+            num_messages = wm_msgs.shape[0] # 청크 수
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid message format: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid message or error during conversion: {e}")
 
-        # 3. Create random masks
+        # 3. Create random masks and sort them by x-coordinate
+        # 마스크 생성 시 device 명시
         masks = create_random_mask(img_pt, num_masks=num_messages, mask_percentage=embed_request.mask_proportion).to(device)
+        # 마스크 정렬 함수 사용
+        sorted_masks, sorted_indices = sort_masks_by_position(masks)
 
-        # 4. Embed watermarks iteratively
+        # 4. Embed watermarks iteratively using sorted masks
         multi_wm_img_tensor = img_pt.clone()
+        # 정렬된 순서로 임베딩
         for i in range(num_messages):
-            wm_msg = wm_msgs[i].unsqueeze(0)
-            mask = masks[i].unsqueeze(0) # Ensure mask is [1, 1, H, W]
+            # wm_msgs도 정렬된 인덱스에 맞춰야 하는가? -> 아니오, 메시지 청크는 순서대로, 마스크만 정렬된 것을 사용
+            wm_msg = wm_msgs[i].unsqueeze(0) # i번째 청크 사용
+            mask = sorted_masks[i].unsqueeze(0) # i번째 정렬된 마스크 사용
             with torch.no_grad():
-                 outputs = image_watermark_model.embed(img_pt, wm_msg)
+                 # 원본 이미지(img_pt)와 메시지 청크, 마스크를 사용해 임베딩
+                 # 주의: embed 함수가 mask 인자를 직접 받는지 확인 필요.
+                 # watermark-anything의 embed는 mask를 직접 받지 않음.
+                 # 따라서, embed 결과와 원본 이미지를 마스크를 이용해 결합해야 함.
+                 outputs = image_watermark_model.embed(img_pt, wm_msg) # 원본 이미지에 각 청크 임베딩 시도
             watermarked_segment = outputs['imgs_w']
+            # 마스크를 이용해 해당 영역만 업데이트
             multi_wm_img_tensor = watermarked_segment * mask + multi_wm_img_tensor * (1 - mask)
 
-        # 5. Postprocess the final watermarked tensor (utils 함수 사용)
+
+        # 5. Postprocess the final watermarked tensor
         final_img_tensor_unnormalized = unnormalize_img(multi_wm_img_tensor.squeeze(0))
         result_image = Image.fromarray((final_img_tensor_unnormalized.permute(1, 2, 0).detach().cpu().numpy() * 255).astype('uint8'))
 
-        # 6. Save the result image to the static directory
-        filename = f"{uuid.uuid4()}.png" # 고유 파일명 생성
+        # 6. Save the result image
+        filename = f"{uuid.uuid4()}.png"
         save_path = os.path.join(IMAGE_DIR, filename)
         try:
             result_image.save(save_path, format="PNG")
@@ -215,33 +233,28 @@ async def embed_image_endpoint(embed_request: ImageEmbedRequest, http_request: R
             raise HTTPException(status_code=500, detail=f"Internal server error saving image: {e}")
 
         # 6.1. Calculate and save the difference image
-        original_img_tensor_unnormalized = unnormalize_img(img_pt.squeeze(0)) # 원본 이미지 텐서
+        original_img_tensor_unnormalized = unnormalize_img(img_pt.squeeze(0))
         original_np = (original_img_tensor_unnormalized.permute(1, 2, 0).detach().cpu().numpy() * 255).astype('uint8')
         watermarked_np = (final_img_tensor_unnormalized.permute(1, 2, 0).detach().cpu().numpy() * 255).astype('uint8')
-
-        # 차이 계산 및 시각화 (inference_utils.py 참고)
         delta = watermarked_np.astype(np.float32) - original_np.astype(np.float32)
-        delta_visual = np.clip(np.abs(10 * delta), 0, 255).astype('uint8') # 스케일링 및 클리핑
-
-        # Matplotlib을 사용하여 흑백 이미지로 저장
+        delta_visual = np.clip(np.abs(10 * delta), 0, 255).astype('uint8')
         diff_filename = f"diff_{uuid.uuid4()}.png"
         diff_save_path = os.path.join(IMAGE_DIR, diff_filename)
         try:
-            plt.imsave(diff_save_path, delta_visual.mean(axis=2), cmap='hot', format='png') # 흑백 'hot' colormap 사용
+            plt.imsave(diff_save_path, delta_visual.mean(axis=2), cmap='hot', format='png')
         except Exception as e:
             print(f"Error saving difference image file: {e}")
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"Internal server error saving difference image: {e}")
 
-        # 7. Construct the full URLs for the saved images
+        # 7. Construct the full URLs
         base_url = str(http_request.base_url)
         static_path = os.path.join("static", "generated_images", filename).replace("\\", "/")
         image_url = f"{base_url.rstrip('/')}/{static_path.lstrip('/')}"
-
         diff_static_path = os.path.join("static", "generated_images", diff_filename).replace("\\", "/")
         difference_image_url = f"{base_url.rstrip('/')}/{diff_static_path.lstrip('/')}"
 
-        # 8. Return the URLs in the response
+        # 8. Return the URLs
         return ImageEmbedResponse(image_url=image_url, difference_image_url=difference_image_url)
 
     except HTTPException as e:
@@ -254,15 +267,16 @@ async def embed_image_endpoint(embed_request: ImageEmbedRequest, http_request: R
 
 # --- Image Watermark Detection Endpoint ---
 @app.post("/detect_image_watermark",
-          response_model=ImageDetectResponse,
-          summary="Detect watermark messages and visualize clusters with legend",
-          description="Takes a Base64 encoded image, detects watermark messages, and returns the messages along with a URL to a visualization image where detected clusters are colored and include a legend mapping colors to messages.")
+          response_model=ImageDetectResponseSchema,
+          summary="Detect watermark, decode message string, visualize clusters",
+          description="Takes Base64 image, detects watermark chunks, sorts them by position, decodes the full string message, and returns the message, individual chunks, and visualization URL.")
 async def detect_image_watermark_endpoint(request: ImageDetectRequest, http_request: Request):
     """
-    Detects watermark messages, saves a visualization of the detected message clusters
-    colored by message including a legend, and returns the URL.
+    Detects watermark message chunks, sorts them by estimated position,
+    decodes the full string, saves a visualization of the detected clusters,
+    and returns the decoded string and URL.
 
-    - **request**: Contains `image_base64`, `epsilon`, and `min_samples`.
+    - **request**: Contains `image_base64`, `epsilon`, `min_samples`.
     - **http_request**: Used to construct the base URL for the response.
     """
     if image_watermark_model is None:
@@ -270,95 +284,141 @@ async def detect_image_watermark_endpoint(request: ImageDetectRequest, http_requ
     if default_transform is None or multiwm_dbscan is None or msg2str is None or plt is None:
          raise HTTPException(status_code=500, detail="Required image processing/detection/plotting functions not available.")
 
-    cluster_visualization_url = None # URL 초기화
+    cluster_visualization_url = None
+    decoded_message = None
+    num_chunks_found = 0
+    detected_messages_list = []
     try:
-        # 1. Load image from Base64 string
+        # 1. Load image
         pil_image = load_image_from_base64(request.image_base64)
-        img_pt = default_transform(pil_image).unsqueeze(0).to(device) # [1, 3, H, W]
-        _, _, H, W = img_pt.shape # Get image dimensions
+        img_pt = default_transform(pil_image).unsqueeze(0).to(device)
+        _, _, H, W = img_pt.shape
 
         # 2. Detect watermark signals
         with torch.no_grad():
-            preds = image_watermark_model.detect(img_pt)["preds"].to(device)
+            # 모델의 detect 결과에서 preds 가져오기
+            preds = image_watermark_model.detect(img_pt)["preds"].to(device) # GPU로 이동 확인
 
         # 3. Extract predictions
-        mask_preds = F.sigmoid(preds[:, 0, :, :]) # [1, H_pred, W_pred]
-        bit_preds = preds[:, 1:, :, :] # [1, C-1, H_pred, W_pred]
+        mask_preds = F.sigmoid(preds[:, 0, :, :])
+        bit_preds = preds[:, 1:, :, :]
 
         # 4. Use DBSCAN to find message centroids and pixel positions
+        # multiwm_dbscan은 centroids(dict)와 positions(tensor) 반환
         centroids, positions = multiwm_dbscan(
             bit_preds,
             mask_preds,
             epsilon=request.epsilon,
             min_samples=request.min_samples
         )
+        # positions 텐서를 이후 처리를 위해 device 유지 또는 필요시 cpu() 호출
 
-        # 4.1 Visualize and save cluster image with legend if centroids are found
+        # 5. Sort detected centroids by position and decode message
+        sorted_centroids_tensor = None
+        if centroids:
+            # centroids 정렬 함수 사용 (positions 텐서는 device에 있을 수 있음)
+            # sort_centroids_by_position은 내부에서 cpu 처리 후 tensor 반환
+            sorted_centroids_tensor = sort_centroids_by_position(centroids, positions.squeeze(0)) # positions는 [1, H, W] -> [H, W]
+
+            if sorted_centroids_tensor is not None and sorted_centroids_tensor.nelement() > 0: # Check if tensor is not empty
+                num_chunks_found = sorted_centroids_tensor.shape[0]
+                # BinaryStringConverter를 사용하여 정렬된 텐서 디코딩
+                decoded_message = converter.binary_to_string(sorted_centroids_tensor)
+
+                # --- detected_messages 리스트 생성 ---
+                for i in range(num_chunks_found):
+                    chunk_tensor = sorted_centroids_tensor[i]
+                    # msg2str을 사용하여 이진 문자열 표현 생성
+                    chunk_str = msg2str(chunk_tensor.cpu()) # CPU로 이동 후 변환
+                    detected_messages_list.append(DetectedMessageInfo(message=chunk_str))
+                # ------------------------------------
+
+            else:
+                 num_chunks_found = 0
+                 decoded_message = "" # 빈 문자열 또는 None
+                 detected_messages_list = [] # 빈 리스트
+        else:
+            num_chunks_found = 0
+            decoded_message = "" # 빈 문자열 또는 None
+            detected_messages_list = [] # 빈 리스트
+
+
+        # 6. Visualize and save cluster image with legend if centroids are found
         if centroids: # Check if centroids dictionary is not empty
-            fig = None # Initialize fig to ensure it's closed in finally block
+            fig = None
             try:
-                # Ensure positions is a tensor we can work with
-                if not isinstance(positions, torch.Tensor) or positions.dim() < 2:
-                     print(f"Warning: 'positions' returned by multiwm_dbscan is not a valid tensor. Skipping visualization.")
+                # positions 텐서 유효성 검사 및 리사이즈
+                positions_squeezed = positions.squeeze(0) # [H_pred, W_pred]
+                if positions_squeezed.dim() != 2:
+                     print(f"Warning: 'positions' tensor has unexpected shape {positions.shape}. Skipping visualization.")
                 else:
-                    # Resize positions tensor
-                    positions_pred_h, positions_pred_w = positions.shape[-2:]
+                    positions_pred_h, positions_pred_w = positions_squeezed.shape
+                    # 리사이즈 로직 (필요한 경우)
                     if positions_pred_h != H or positions_pred_w != W:
-                        print(f"Resizing positions tensor from {positions.shape} to target size ({H}, {W})")
-                        if positions.dim() == 2: positions = positions.unsqueeze(0)
-                        if positions.dim() == 3: positions = positions.unsqueeze(0)
+                        # 리사이즈 시에는 Float Tensor로 변환 후 수행
                         positions_resized = TF_resize(
-                            positions.float(), size=[H, W], interpolation=InterpolationMode.NEAREST, antialias=None
-                        ).long()
+                            positions_squeezed.unsqueeze(0).float(), # [1, H_pred, W_pred] 형태로 변환
+                            size=[H, W],
+                            interpolation=InterpolationMode.NEAREST,
+                            antialias=None # NEAREST 사용 시 antialias=None 권장
+                        ).long().squeeze(0) # 다시 [H, W] 형태로
                     else:
-                        positions_resized = positions.long()
-                    positions_np = positions_resized.squeeze().cpu().numpy()
+                        positions_resized = positions_squeezed.long()
+
+                    positions_np = positions_resized.cpu().numpy()
 
                     if positions_np.shape != (H, W):
                         print(f"Error: Resized positions_np shape {positions_np.shape} does not match target ({H}, {W}). Skipping visualization.")
                     else:
-                        # Create an empty RGB image
+                        # 클러스터 시각화 로직 (이전과 유사하게 진행)
                         cluster_image_np = np.zeros((H, W, 3), dtype=np.uint8)
-                        legend_elements = [] # For storing legend handles and labels
+                        legend_elements = []
 
-                        # Generate distinct colors and prepare legend elements
-                        sorted_centroids = dict(sorted(centroids.items())) # Use sorted for consistent legend order
+                        # cluster_centers 계산 추가 (sort_centroids_by_position 내부 로직 참고)
+                        cluster_centers = {}
+                        positions_cpu = positions.cpu() # CPU로 이동
+                        H_pos, W_pos = positions_cpu.shape[-2:] # positions 형태가 [1, H, W] 또는 [H, W] 일 수 있음
+
+                        for cluster_id in centroids.keys():
+                             if cluster_id < 0: continue # 배경 레이블 (-1) 무시
+                             y, x = torch.where(positions_cpu.squeeze() == cluster_id) # squeeze()로 차원 축소
+                             if len(x) > 0:
+                                 cluster_centers[cluster_id] = x.float().mean().item()
+                             else:
+                                 cluster_centers[cluster_id] = float('inf')
+
+                        # 범례 순서를 위해 정렬된 ID 사용 (이제 cluster_centers 사용 가능)
+                        sorted_cluster_ids = sorted([k for k in centroids.keys() if k >= 0], key=lambda k: cluster_centers.get(k, float('inf')))
+
                         colors = {}
-                        for cluster_id, msg_tensor in sorted_centroids.items():
-                            if cluster_id < 0: continue # Skip background label if present
-
-                            # Generate random bright color
-                            r = random.randint(100, 255)
-                            g = random.randint(100, 255)
-                            b = random.randint(100, 255)
+                        # 정렬된 ID 순서대로 색상 할당 및 범례 생성
+                        for cluster_id in sorted_cluster_ids:
+                            r, g, b = random.randint(100, 255), random.randint(100, 255), random.randint(100, 255)
                             color_rgb = (r, g, b)
                             colors[cluster_id] = color_rgb
 
-                            # Color the pixels
                             cluster_mask = (positions_np == cluster_id)
                             cluster_image_np[cluster_mask] = color_rgb
 
-                            # Prepare legend element (normalized color for matplotlib)
                             color_normalized = (r/255.0, g/255.0, b/255.0)
-                            msg_string = msg2str(msg_tensor.detach().cpu()) # Get message string
-                            legend_elements.append(mpatches.Patch(color=color_normalized, label=f"{msg_string}"))
+                            # 범례에는 msg2str 사용 (개별 청크 정보)
+                            msg_string = msg2str(centroids[cluster_id].cpu()) # CPU로 이동 후 변환
+                            legend_elements.append(mpatches.Patch(color=color_normalized, label=f"C{int(cluster_id)}: {msg_string}"))
 
-
-                        # Create plot and save with legend using Matplotlib
-                        fig, ax = plt.subplots(figsize=(W/100, H/100), dpi=100) # Adjust figsize based on image dimensions if needed
+                        # Matplotlib으로 저장
+                        fig, ax = plt.subplots(figsize=(W/100, H/100), dpi=100)
                         ax.imshow(cluster_image_np)
-                        ax.axis('off') # Turn off axis labels and ticks
+                        ax.axis('off')
 
-                        # Add legend outside the plot area
                         if legend_elements:
-                            ax.legend(handles=legend_elements, loc='upper right', fancybox=True, shadow=True) # Adjust ncol
+                             # 범례 위치 조정 (겹치지 않도록)
+                             ax.legend(handles=legend_elements, loc='upper right', fancybox=True, shadow=True)
 
                         cluster_filename = f"cluster_{uuid.uuid4()}.png"
                         cluster_save_path = os.path.join(IMAGE_DIR, cluster_filename)
-                        # Save the figure, bbox_inches='tight' removes extra whitespace
                         plt.savefig(cluster_save_path, format="PNG", bbox_inches='tight', pad_inches=0.1)
 
-                        # Construct URL
+                        # URL 생성
                         base_url = str(http_request.base_url)
                         cluster_static_path = os.path.join("static", "generated_images", cluster_filename).replace("\\", "/")
                         cluster_visualization_url = f"{base_url.rstrip('/')}/{cluster_static_path.lstrip('/')}"
@@ -366,25 +426,18 @@ async def detect_image_watermark_endpoint(request: ImageDetectRequest, http_requ
             except Exception as e:
                 print(f"Error saving cluster visualization image: {e}")
                 traceback.print_exc()
-                cluster_visualization_url = None
+                cluster_visualization_url = None # 에러 시 URL None
             finally:
-                 if fig: # Close the figure to free memory
+                 if fig:
                       plt.close(fig)
 
 
-        # 5. Format results
-        detected_messages_info = []
-        if centroids:
-             sorted_centroids = dict(sorted(centroids.items())) # Ensure consistent order with legend
-             centroids_pt = torch.stack([t for i, t in sorted_centroids.items() if i >= 0]).detach().cpu() # Filter background if needed
-             for msg_tensor in centroids_pt:
-                 msg_string = msg2str(msg_tensor)
-                 detected_messages_info.append(DetectedMessageInfo(message=msg_string))
-
-        return ImageDetectResponse(
-            num_messages_found=len(detected_messages_info),
-            detected_messages=detected_messages_info,
-            predicted_position_url=cluster_visualization_url
+        # 7. Format and return results
+        return ImageDetectResponseSchema(
+            num_chunks_found=num_chunks_found, # 감지된 청크 수
+            detected_messages=detected_messages_list, # 생성된 리스트 반환
+            decoded_message=decoded_message,   # 디코딩된 최종 문자열
+            predicted_position_url=cluster_visualization_url # 시각화 URL
         )
 
     except HTTPException as e:

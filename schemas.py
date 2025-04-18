@@ -1,13 +1,11 @@
-from pydantic import BaseModel, Field, validator, HttpUrl
+from pydantic import BaseModel, Field
 from typing import Optional, List
 
 # Hyperparameters (can be moved to a config file later if needed)
 DEFAULT_PROMPT = "스스로를 자랑해 봐"
 DEFAULT_MAX_NEW_TOKENS = 128
 TEXT_DETECTOR_THRESHOLD = 0.5
-DEFAULT_MESSAGE_LENGTH = 32 # 메시지 길이 상수 추가
-# 기본 메시지 정의: [ [0]*32, [1]*32 ]
-DEFAULT_MESSAGES = [[0] * DEFAULT_MESSAGE_LENGTH, [1] * DEFAULT_MESSAGE_LENGTH]
+DEFAULT_WATERMARK_MESSAGE = "헬로월드"
 
 # --- Text Request & Response Models ---
 class TextGenerationRequest(BaseModel):
@@ -37,21 +35,8 @@ class TextDetectionResponse(BaseModel):
 class ImageEmbedRequest(BaseModel):
     """Request model for embedding image watermark."""
     image_base64: str = Field(..., description="Base64 encoded image string (with optional data URL prefix)")
-    messages: List[List[int]] = Field(default=DEFAULT_MESSAGES, description=f"List of watermark messages. Each message must be a list of {DEFAULT_MESSAGE_LENGTH} bits (0 or 1). Defaults to one all-zero and one all-one message.")
+    message: str = Field(default=DEFAULT_WATERMARK_MESSAGE, description="The string message to embed as a watermark.")
     mask_proportion: float = Field(0.1, ge=0.0, le=1.0, description="Maximum proportion of pixels for each watermark mask (0.0 to 1.0).")
-
-    @validator('messages')
-    def validate_messages(cls, v):
-        if not v: # 빈 리스트 방지
-            raise ValueError("Messages list cannot be empty.")
-        for i, message in enumerate(v):
-            if not isinstance(message, list):
-                 raise ValueError(f"Message at index {i} must be a list.")
-            if len(message) != DEFAULT_MESSAGE_LENGTH:
-                raise ValueError(f"Message at index {i} must have length {DEFAULT_MESSAGE_LENGTH}, got {len(message)}")
-            if not all(bit in [0, 1] for bit in message):
-                raise ValueError(f"Message bits at index {i} must be 0 or 1.")
-        return v
 
 class ImageEmbedResponse(BaseModel):
     """Response model for embedding image watermark."""
@@ -66,10 +51,10 @@ class ImageDetectRequest(BaseModel):
 
 
 class DetectedMessageInfo(BaseModel):
-    message: str = Field(..., description="Detected watermark message (string representation)")
-    # 필요시 여기에 추가 정보 필드 정의 (예: cluster_id, confidence 등)
+    message: str = Field(..., description="Detected watermark message chunk (string representation of binary)")
 
 class ImageDetectResponse(BaseModel):
-    num_messages_found: int = Field(..., description="Number of distinct watermark messages found")
-    detected_messages: List[DetectedMessageInfo] = Field(..., description="List of detected watermark messages")
-    predicted_position_url: Optional[str] = Field(None, description="URL of the saved cluster visualization image (colored by message)") 
+    num_chunks_found: int = Field(..., description="Number of distinct watermark message chunks found")
+    detected_messages: List[DetectedMessageInfo] = Field(..., description="List of detected watermark message chunks (binary string format, sorted by position)")
+    decoded_message: Optional[str] = Field(None, description="The fully decoded watermark message string.")
+    predicted_position_url: Optional[str] = Field(None, description="URL of the saved cluster visualization image (colored by message chunk)") 
