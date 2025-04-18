@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 import uvicorn
 
 # Import from new modules
-from model_loader import load_models_and_processors
+from model_loader import load_models_and_processors, load_image_watermark_model
 from schemas import (
     TextGenerationRequest,
     TextGenerationResponse,
@@ -17,12 +17,16 @@ from schemas import (
 
 # Hyperparameters (keep main constants or move to config)
 MODEL_NAME = "LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct"
+IMAGE_CHECKPOINT_DIR = "watermark_anything/checkpoints" # 이미지 모델 체크포인트 디렉토리 경로 (checkpoints/params.json에서 설정파일 경로 수정해야 함)
 
 # --- Load Models and Processors ---
 # Call the loading function from model_loader
-model, tokenizer, watermark_processor, watermark_detector, device = load_models_and_processors(
+text_model, tokenizer, watermark_processor, watermark_detector, device = load_models_and_processors(
     MODEL_NAME, TEXT_DETECTOR_THRESHOLD
 )
+
+# model_loader에서 이미지 워터마킹 모델 로딩 함수 호출
+image_watermark_model = load_image_watermark_model(checkpoint_dir=IMAGE_CHECKPOINT_DIR, device=device)
 
 # --- API Definition ---
 app = FastAPI(
@@ -44,8 +48,8 @@ async def generate_text_endpoint(request: TextGenerationRequest):
     - **max_new_tokens**: The maximum number of new tokens to generate. Defaults from schemas.
     - **watermark**: Boolean flag to enable watermark generation (default: False).
     """
-    if model is None or tokenizer is None:
-        raise HTTPException(status_code=503, detail="Model not loaded. Service unavailable.")
+    if text_model is None or tokenizer is None:
+        raise HTTPException(status_code=503, detail="Text model not loaded. Service unavailable.")
 
     # Check if watermark is requested but processor is not available
     if request.watermark and watermark_processor is None:
@@ -68,7 +72,7 @@ async def generate_text_endpoint(request: TextGenerationRequest):
         if request.watermark:
             logits_processor_list = LogitsProcessorList([watermark_processor])
 
-        generated_ids = model.generate(
+        generated_ids = text_model.generate(
             input_ids,
             eos_token_id=tokenizer.eos_token_id,
             max_new_tokens=request.max_new_tokens, # Use max_new_tokens from request

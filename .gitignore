@@ -5,4 +5,6 @@ __pycache__
 *.pyw
 *.pyz
 .DS_Store
+lm_watermarking
+watermark_anything
 
