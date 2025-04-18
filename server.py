@@ -1,16 +1,13 @@
 import torch
+import torch.nn.functional as F
 from transformers import LogitsProcessorList
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 import uvicorn
-import base64
-import io
-from PIL import Image, UnidentifiedImageError
-import torch.nn.functional as F
 import traceback
-import re
 import os
 import uuid
+from PIL import Image
 
 # Import from new modules
 from model_loader import load_models_and_processors, load_image_watermark_model
@@ -29,26 +26,17 @@ from schemas import (
     TEXT_DETECTOR_THRESHOLD
 )
 
+# 헬퍼 함수 import 추가
+from utils import load_image_from_base64, unnormalize_img
+
 # watermark_anything 유틸리티 함수 import
-try:
-    from watermark_anything.notebooks.inference_utils import (
-        default_transform,
-        multiwm_dbscan,
-        msg2str,
-        create_random_mask,
-    )
-    def unnormalize_img(img_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
-        unnormalized = img_tensor.clone()
-        for t, m, s in zip(unnormalized, mean, std):
-            t.mul_(s).add_(m)
-        return unnormalized.clamp(0, 1)
-except ImportError as e:
-    print(f"Warning: Could not import watermark_anything utilities: {e}. Image watermarking endpoints might not work.")
-    default_transform = None
-    multiwm_dbscan = None
-    msg2str = None
-    create_random_mask = None
-    unnormalize_img = None
+from watermark_anything.notebooks.inference_utils import (
+    default_transform,
+    multiwm_dbscan,
+    msg2str,
+    create_random_mask,
+)
+
 
 # Hyperparameters
 MODEL_NAME = "LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct"
@@ -165,28 +153,6 @@ async def detect_text_watermark_endpoint(request: TextDetectionRequest):
     finally:
         watermark_detector.z_threshold = original_threshold
 
-# --- Helper function to load image from Base64 ---
-def load_image_from_base64(base64_string: str) -> Image.Image:
-    """Decodes a Base64 string (with optional data URL prefix) into a PIL Image."""
-    try:
-        # 데이터 URL 프리픽스 제거 (예: "data:image/png;base64,")
-        base64_data = re.sub('^data:image/.+;base64,', '', base64_string)
-        # Base64 디코딩
-        image_data = base64.b64decode(base64_data)
-        # BytesIO를 사용하여 이미지 열기
-        image = Image.open(io.BytesIO(image_data))
-        # 이미지 형식이 RGB가 아니면 변환
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        return image
-    except (base64.binascii.Error, ValueError, TypeError) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid Base64 string: {e}")
-    except UnidentifiedImageError:
-        raise HTTPException(status_code=400, detail="Invalid image data in Base64 string.")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to load image from Base64: {e}")
-
-
 # --- Image Watermark Embedding Endpoint ---
 @app.post("/embed_image",
           response_model=ImageEmbedResponse, # 응답 모델 확인
@@ -205,7 +171,7 @@ async def embed_image_endpoint(embed_request: ImageEmbedRequest, http_request: R
          raise HTTPException(status_code=500, detail="Required image processing functions not available.")
 
     try:
-        # 1. Load image from Base64
+        # 1. Load image from Base64 (utils 함수 사용)
         pil_image = load_image_from_base64(embed_request.image_base64)
         img_pt = default_transform(pil_image).unsqueeze(0).to(device)
 
@@ -229,7 +195,7 @@ async def embed_image_endpoint(embed_request: ImageEmbedRequest, http_request: R
             watermarked_segment = outputs['imgs_w']
             multi_wm_img_tensor = watermarked_segment * mask + multi_wm_img_tensor * (1 - mask)
 
-        # 5. Postprocess the final watermarked tensor
+        # 5. Postprocess the final watermarked tensor (utils 함수 사용)
         final_img_tensor_unnormalized = unnormalize_img(multi_wm_img_tensor.squeeze(0))
         result_image = Image.fromarray((final_img_tensor_unnormalized.permute(1, 2, 0).detach().cpu().numpy() * 255).astype('uint8'))
 
@@ -278,7 +244,7 @@ async def detect_image_watermark_endpoint(request: ImageDetectRequest):
          raise HTTPException(status_code=500, detail="Required image processing/detection functions not available.")
 
     try:
-        # 1. Load image from Base64 string
+        # 1. Load image from Base64 string (utils 함수 사용)
         pil_image = load_image_from_base64(request.image_base64)
         img_pt = default_transform(pil_image).unsqueeze(0).to(device) # [1, 3, H, W]
 
