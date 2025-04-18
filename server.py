@@ -10,6 +10,9 @@ import uuid
 from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
+import random
+import matplotlib.patches as mpatches
+from torchvision.transforms.functional import InterpolationMode, resize as TF_resize
 
 # Import from new modules
 from model_loader import load_models_and_processors, load_image_watermark_model
@@ -252,51 +255,136 @@ async def embed_image_endpoint(embed_request: ImageEmbedRequest, http_request: R
 # --- Image Watermark Detection Endpoint ---
 @app.post("/detect_image_watermark",
           response_model=ImageDetectResponse,
-          summary="Detect watermark messages in an image provided as Base64",
-          description="Takes a Base64 encoded image file and DBSCAN parameters, detects watermark messages using WAM, and returns the found messages.")
-async def detect_image_watermark_endpoint(request: ImageDetectRequest):
+          summary="Detect watermark messages and visualize clusters with legend",
+          description="Takes a Base64 encoded image, detects watermark messages, and returns the messages along with a URL to a visualization image where detected clusters are colored and include a legend mapping colors to messages.")
+async def detect_image_watermark_endpoint(request: ImageDetectRequest, http_request: Request):
     """
-    Detects watermark messages embedded in the image provided as Base64.
+    Detects watermark messages, saves a visualization of the detected message clusters
+    colored by message including a legend, and returns the URL.
 
     - **request**: Contains `image_base64`, `epsilon`, and `min_samples`.
+    - **http_request**: Used to construct the base URL for the response.
     """
     if image_watermark_model is None:
         raise HTTPException(status_code=503, detail="Image watermark model (WAM) not loaded. Service unavailable.")
-    if default_transform is None or multiwm_dbscan is None or msg2str is None:
-         raise HTTPException(status_code=500, detail="Required image processing/detection functions not available.")
+    if default_transform is None or multiwm_dbscan is None or msg2str is None or plt is None:
+         raise HTTPException(status_code=500, detail="Required image processing/detection/plotting functions not available.")
 
+    cluster_visualization_url = None # URL 초기화
     try:
-        # 1. Load image from Base64 string (utils 함수 사용)
+        # 1. Load image from Base64 string
         pil_image = load_image_from_base64(request.image_base64)
         img_pt = default_transform(pil_image).unsqueeze(0).to(device) # [1, 3, H, W]
+        _, _, H, W = img_pt.shape # Get image dimensions
 
         # 2. Detect watermark signals
-        with torch.no_grad(): # 탐지 시에도 그래디언트 계산 비활성화
+        with torch.no_grad():
             preds = image_watermark_model.detect(img_pt)["preds"].to(device)
 
         # 3. Extract predictions
-        mask_preds = F.sigmoid(preds[:, 0, :, :])
-        bit_preds = preds[:, 1:, :, :]
+        mask_preds = F.sigmoid(preds[:, 0, :, :]) # [1, H_pred, W_pred]
+        bit_preds = preds[:, 1:, :, :] # [1, C-1, H_pred, W_pred]
 
-        # 4. Use DBSCAN to find message centroids
+        # 4. Use DBSCAN to find message centroids and pixel positions
         centroids, positions = multiwm_dbscan(
             bit_preds,
             mask_preds,
-            epsilon=request.epsilon, # 요청에서 값 사용
-            min_samples=request.min_samples # 요청에서 값 사용
+            epsilon=request.epsilon,
+            min_samples=request.min_samples
         )
+
+        # 4.1 Visualize and save cluster image with legend if centroids are found
+        if centroids: # Check if centroids dictionary is not empty
+            fig = None # Initialize fig to ensure it's closed in finally block
+            try:
+                # Ensure positions is a tensor we can work with
+                if not isinstance(positions, torch.Tensor) or positions.dim() < 2:
+                     print(f"Warning: 'positions' returned by multiwm_dbscan is not a valid tensor. Skipping visualization.")
+                else:
+                    # Resize positions tensor
+                    positions_pred_h, positions_pred_w = positions.shape[-2:]
+                    if positions_pred_h != H or positions_pred_w != W:
+                        print(f"Resizing positions tensor from {positions.shape} to target size ({H}, {W})")
+                        if positions.dim() == 2: positions = positions.unsqueeze(0)
+                        if positions.dim() == 3: positions = positions.unsqueeze(0)
+                        positions_resized = TF_resize(
+                            positions.float(), size=[H, W], interpolation=InterpolationMode.NEAREST, antialias=None
+                        ).long()
+                    else:
+                        positions_resized = positions.long()
+                    positions_np = positions_resized.squeeze().cpu().numpy()
+
+                    if positions_np.shape != (H, W):
+                        print(f"Error: Resized positions_np shape {positions_np.shape} does not match target ({H}, {W}). Skipping visualization.")
+                    else:
+                        # Create an empty RGB image
+                        cluster_image_np = np.zeros((H, W, 3), dtype=np.uint8)
+                        legend_elements = [] # For storing legend handles and labels
+
+                        # Generate distinct colors and prepare legend elements
+                        sorted_centroids = dict(sorted(centroids.items())) # Use sorted for consistent legend order
+                        colors = {}
+                        for cluster_id, msg_tensor in sorted_centroids.items():
+                            if cluster_id < 0: continue # Skip background label if present
+
+                            # Generate random bright color
+                            r = random.randint(100, 255)
+                            g = random.randint(100, 255)
+                            b = random.randint(100, 255)
+                            color_rgb = (r, g, b)
+                            colors[cluster_id] = color_rgb
+
+                            # Color the pixels
+                            cluster_mask = (positions_np == cluster_id)
+                            cluster_image_np[cluster_mask] = color_rgb
+
+                            # Prepare legend element (normalized color for matplotlib)
+                            color_normalized = (r/255.0, g/255.0, b/255.0)
+                            msg_string = msg2str(msg_tensor.detach().cpu()) # Get message string
+                            legend_elements.append(mpatches.Patch(color=color_normalized, label=f"{msg_string}"))
+
+
+                        # Create plot and save with legend using Matplotlib
+                        fig, ax = plt.subplots(figsize=(W/100, H/100), dpi=100) # Adjust figsize based on image dimensions if needed
+                        ax.imshow(cluster_image_np)
+                        ax.axis('off') # Turn off axis labels and ticks
+
+                        # Add legend outside the plot area
+                        if legend_elements:
+                            ax.legend(handles=legend_elements, loc='upper right', fancybox=True, shadow=True) # Adjust ncol
+
+                        cluster_filename = f"cluster_{uuid.uuid4()}.png"
+                        cluster_save_path = os.path.join(IMAGE_DIR, cluster_filename)
+                        # Save the figure, bbox_inches='tight' removes extra whitespace
+                        plt.savefig(cluster_save_path, format="PNG", bbox_inches='tight', pad_inches=0.1)
+
+                        # Construct URL
+                        base_url = str(http_request.base_url)
+                        cluster_static_path = os.path.join("static", "generated_images", cluster_filename).replace("\\", "/")
+                        cluster_visualization_url = f"{base_url.rstrip('/')}/{cluster_static_path.lstrip('/')}"
+
+            except Exception as e:
+                print(f"Error saving cluster visualization image: {e}")
+                traceback.print_exc()
+                cluster_visualization_url = None
+            finally:
+                 if fig: # Close the figure to free memory
+                      plt.close(fig)
+
 
         # 5. Format results
         detected_messages_info = []
         if centroids:
-             centroids_pt = torch.stack(list(centroids.values())).detach().cpu()
+             sorted_centroids = dict(sorted(centroids.items())) # Ensure consistent order with legend
+             centroids_pt = torch.stack([t for i, t in sorted_centroids.items() if i >= 0]).detach().cpu() # Filter background if needed
              for msg_tensor in centroids_pt:
                  msg_string = msg2str(msg_tensor)
                  detected_messages_info.append(DetectedMessageInfo(message=msg_string))
 
         return ImageDetectResponse(
             num_messages_found=len(detected_messages_info),
-            detected_messages=detected_messages_info
+            detected_messages=detected_messages_info,
+            predicted_position_url=cluster_visualization_url
         )
 
     except HTTPException as e:

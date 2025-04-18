@@ -71,4 +71,5 @@ class DetectedMessageInfo(BaseModel):
 
 class ImageDetectResponse(BaseModel):
     num_messages_found: int = Field(..., description="Number of distinct watermark messages found")
-    detected_messages: List[DetectedMessageInfo] = Field(..., description="List of detected watermark messages") 
+    detected_messages: List[DetectedMessageInfo] = Field(..., description="List of detected watermark messages")
+    predicted_position_url: Optional[str] = Field(None, description="URL of the saved cluster visualization image (colored by message)") 
